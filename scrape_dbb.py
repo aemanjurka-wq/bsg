@@ -1,19 +1,14 @@
 """
-BSG Usinger Land — DBB Spielplan Scraper (Playwright + iCal-Button)
-====================================================================
-basketball-bund.net rendert per JavaScript. Der iCal-Link wird erst
-nach Laden der Seite sichtbar. Dieses Script:
-  1. Öffnet jede Mannschaftsseite mit Playwright (headless Chromium)
-  2. Wartet bis der Spielplan geladen ist
-  3. Liest die Spielplandaten direkt aus der gerenderten Tabelle
-  4. Speichert alles als spiele.json
+BSG Usinger Land — DBB Scraper mit Debug-Modus
+================================================
+Dieses Script:
+1. Öffnet basketball-bund.net/mannschaft/314544/spielplan
+2. Wartet 8 Sekunden auf JS-Rendering
+3. Speichert den gerenderten HTML als debug_herren.html
+4. Macht einen Screenshot als debug_herren.png
+5. Versucht Spielplan-Daten zu lesen und speichert spiele.json
 
-Installation:
-  pip install playwright icalendar
-  playwright install chromium --with-deps
-
-Lokal testen:
-  python scrape_dbb.py
+So können wir exakt sehen was Playwright auf der Seite sieht.
 """
 
 import asyncio
@@ -22,7 +17,6 @@ import re
 from datetime import datetime, timezone
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-# ── Konfiguration ─────────────────────────────────────────────────────
 TEAMS = {
     "Herren":       "314544",
     "Damen":        "314543",
@@ -32,7 +26,6 @@ TEAMS = {
     "MU14 Bezirk":  "314549",
     "WU14 Bezirk":  "316717",
     "MU14 Kreis":   "314550",
-    "WU14 Kreis":   "316717",
     "Mix U12":      "314551",
     "WU12":         "316675",
     "WU10":         "322003",
@@ -70,89 +63,121 @@ def ergebnis_sieg(text: str):
     return f"{h}:{g}", h > g
 
 
-# ── Spielplan einer Mannschaft scrapen ───────────────────────────────
+async def debug_seite(page, url: str, name: str):
+    """Speichert HTML + Screenshot für Diagnose"""
+    print(f"\n  [DEBUG] Lade {url}")
+    await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
 
-async def scrape_mannschaft(page, team_name: str, mid: str) -> list[dict]:
+    # 8 Sekunden warten für JS-Rendering
+    print(f"  [DEBUG] Warte 8s auf JS-Rendering...")
+    await page.wait_for_timeout(8_000)
+
+    # HTML speichern
+    html = await page.content()
+    fname = f"debug_{name}.html"
+    with open(fname, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"  [DEBUG] HTML gespeichert → {fname} ({len(html)} Zeichen)")
+
+    # Screenshot
+    await page.screenshot(path=f"debug_{name}.png", full_page=False)
+    print(f"  [DEBUG] Screenshot → debug_{name}.png")
+
+    # Was ist auf der Seite?
+    tabellen = await page.query_selector_all("table")
+    print(f"  [DEBUG] Gefundene <table>-Elemente: {len(tabellen)}")
+
+    rows = await page.query_selector_all("table tr")
+    print(f"  [DEBUG] Gefundene <tr>-Elemente: {len(rows)}")
+
+    # Alle relevanten Texte ausgeben
+    body_text = await page.inner_text("body")
+    zeilen = [z.strip() for z in body_text.split("\n") if z.strip()]
+    print(f"  [DEBUG] Sichtbarer Text (erste 30 Zeilen):")
+    for z in zeilen[:30]:
+        print(f"         | {z}")
+
+    return html, rows
+
+
+async def scrape_mannschaft(page, team_name: str, mid: str, debug: bool = False) -> list[dict]:
     url = f"https://www.basketball-bund.net/mannschaft/{mid}/spielplan"
     spiele = []
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        await page.wait_for_timeout(6_000)  # JS braucht Zeit
 
-        # Warten bis entweder eine Tabelle oder der Text "keine Spiele" erscheint
-        try:
-            await page.wait_for_selector("table tr, .no-games, [class*='spielplan']", timeout=20_000)
-        except PWTimeout:
-            print(f"  ⚠  {team_name}: Timeout beim Laden")
+        # Verschiedene Selektoren probieren
+        selektoren = [
+            "table tr",
+            "[class*='spiel']",
+            "[class*='game']",
+            "[class*='match']",
+            "[class*='result']",
+            "tr[class*='row']",
+        ]
+
+        rows = []
+        for sel in selektoren:
+            rows = await page.query_selector_all(sel)
+            if len(rows) > 2:
+                print(f"  [INFO] Selektor '{sel}' → {len(rows)} Elemente")
+                break
+
+        if not rows:
+            print(f"  ⚠  {team_name}: Keine Zeilen gefunden")
             return spiele
 
-        # Alle Tabellenzeilen sammeln
-        rows = await page.query_selector_all("table tr")
-
         for row in rows:
-            cells = await row.query_selector_all("td")
-            if len(cells) < 3:
-                continue
-
-            texte = []
-            for cell in cells:
-                texte.append(((await cell.inner_text()) or "").strip())
-
-            # Datum finden
-            datum = zeit = None
-            for t in texte:
-                d = parse_datum(t)
-                if d:
-                    datum = d
-                    zeit  = parse_zeit(t)
-                    break
-            if not datum:
-                continue
-
-            # Teamnamen aus Links (zuverlässiger als Text-Parsing)
-            links = await row.query_selector_all("a")
-            namen = []
-            for lnk in links:
-                n = ((await lnk.inner_text()) or "").strip()
-                if n and len(n) > 2 and not re.match(r"^\d", n):
-                    namen.append(n)
-
-            heim = namen[0] if len(namen) > 0 else ""
-            gast = namen[1] if len(namen) > 1 else ""
-
-            # Fallback: Zellen direkt lesen
-            if not heim:
-                for i, t in enumerate(texte):
-                    if parse_datum(t) and i + 2 < len(texte):
-                        heim = texte[i + 1]
-                        gast = texte[i + 2]
-                        break
-
-            # Spiel muss BSG betreffen
-            if not (ist_bsg(heim) or ist_bsg(gast)):
-                # Nochmal im Rohtext der Zeile prüfen
-                zeile_text = (await row.inner_text() or "").lower()
-                if not any(s in zeile_text for s in BSG_NAMEN):
+            try:
+                zeile_text = (await row.inner_text() or "").strip()
+                if not zeile_text:
                     continue
 
-            # Ergebnis: in letzter Zelle oder vorletzter
-            ergebnis, heim_sieg = None, None
-            for t in reversed(texte):
-                e, s = ergebnis_sieg(t)
-                if e:
-                    ergebnis  = e
-                    heim_sieg = s
-                    break
+                # Datum in Zeile vorhanden?
+                datum = parse_datum(zeile_text)
+                if not datum:
+                    continue
 
-            spiele.append({
-                "datum":    datum,
-                "zeit":     zeit or "",
-                "team":     team_name,
-                "heim":     heim or "BSG Usinger Land",
-                "gast":     gast or "",
-                "ergebnis": ergebnis,
-                "heimSieg": heim_sieg,
-            })
+                # BSG beteiligt?
+                if not any(s in zeile_text.lower() for s in BSG_NAMEN):
+                    continue
+
+                cells = await row.query_selector_all("td, span, div")
+                texte = []
+                for cell in cells:
+                    t = (await cell.inner_text() or "").strip()
+                    if t:
+                        texte.append(t)
+
+                zeit = parse_zeit(zeile_text)
+
+                # Teamnamen aus Links
+                links = await row.query_selector_all("a")
+                namen = []
+                for lnk in links:
+                    n = (await lnk.inner_text() or "").strip()
+                    if n and len(n) > 2 and not re.match(r"^\d", n):
+                        namen.append(n)
+
+                heim = namen[0] if len(namen) > 0 else ""
+                gast = namen[1] if len(namen) > 1 else ""
+
+                # Ergebnis
+                ergebnis, heim_sieg = ergebnis_sieg(zeile_text)
+
+                spiele.append({
+                    "datum":    datum,
+                    "zeit":     zeit,
+                    "team":     team_name,
+                    "heim":     heim or "BSG Usinger Land",
+                    "gast":     gast or "",
+                    "ergebnis": ergebnis,
+                    "heimSieg": heim_sieg,
+                })
+            except Exception:
+                continue
 
     except Exception as e:
         print(f"  ✗  {team_name}: {e}")
@@ -169,30 +194,28 @@ async def scrape_mannschaft(page, team_name: str, mid: str) -> list[dict]:
     return result
 
 
-# ── Cookie-Banner wegklicken ─────────────────────────────────────────
-
-async def cookie_banner_schliessen(page):
+async def cookie_schliessen(page):
     try:
         await page.goto("https://www.basketball-bund.net", wait_until="domcontentloaded", timeout=20_000)
-        await page.wait_for_timeout(2_000)
-        for btn in await page.query_selector_all("button"):
-            txt = ((await btn.inner_text()) or "").lower()
-            if any(w in txt for w in ["akzeptiere", "zustimmen", "ich akzeptiere", "alle akzeptieren"]):
+        await page.wait_for_timeout(3_000)
+        for btn in await page.query_selector_all("button, a"):
+            txt = (await btn.inner_text() or "").lower()
+            if any(w in txt for w in ["akzeptiere", "zustimmen", "alle akzeptieren", "accept", "ok"]):
                 await btn.click()
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(1_000)
                 print("  ✓  Cookie-Banner geschlossen")
-                return
-    except Exception:
-        pass
+                return True
+        print("  ℹ  Kein Cookie-Banner gefunden")
+    except Exception as e:
+        print(f"  ⚠  Cookie-Banner: {e}")
+    return False
 
-
-# ── Hauptprogramm ────────────────────────────────────────────────────
 
 async def main():
-    print("BSG Usinger Land — Spielplan Scraper")
-    print("=" * 44)
+    print("BSG Usinger Land — Spielplan Scraper (Debug-Modus)")
+    print("=" * 52)
 
-    alle_spiele      = []
+    alle_spiele = []
     bereits_gescrapt = set()
 
     async with async_playwright() as pw:
@@ -204,14 +227,22 @@ async def main():
                 "Chrome/122.0.0.0 Safari/537.36"
             ),
             locale="de-DE",
+            viewport={"width": 1280, "height": 900},
         )
         page = await context.new_page()
 
-        await cookie_banner_schliessen(page)
+        # Cookie-Banner schließen
+        await cookie_schliessen(page)
 
+        # Debug: Herren-Seite genau analysieren
+        print("\n--- DEBUG: Herren-Seite analysieren ---")
+        await debug_seite(page, "https://www.basketball-bund.net/mannschaft/314544/spielplan", "herren")
+
+        # Alle Teams scrapen
+        print("\n--- Alle Teams scrapen ---")
         for team_name, mid in TEAMS.items():
             if mid in bereits_gescrapt:
-                print(f"  ↩  {team_name}: ID {mid} übersprungen")
+                print(f"  ↩  {team_name}: übersprungen")
                 continue
             bereits_gescrapt.add(mid)
             spiele = await scrape_mannschaft(page, team_name, mid)
@@ -219,7 +250,7 @@ async def main():
 
         await browser.close()
 
-    # Global deduplizieren und sortieren
+    # Sortieren und deduplizieren
     seen, eindeutig = set(), []
     for s in alle_spiele:
         key = (s["datum"], s["heim"], s["gast"])
@@ -237,13 +268,8 @@ async def main():
     with open("spiele.json", "w", encoding="utf-8") as f:
         json.dump(ausgabe, f, ensure_ascii=False, indent=2)
 
-    print("=" * 44)
+    print("\n" + "=" * 52)
     print(f"✓  {len(eindeutig)} Spiele → spiele.json")
-    if len(eindeutig) == 0:
-        print("\n  Mögliche Ursachen für 0 Spiele:")
-        print("  • Saison noch nicht gestartet / keine Spiele eingetragen")
-        print("  • basketball-bund.net hat die Seitenstruktur geändert")
-        print("  • Cookie-Banner hat Tabelle blockiert")
 
 
 if __name__ == "__main__":
