@@ -1,222 +1,231 @@
 """
-BSG Usinger Land — Spielplan via iCalendar (.ics)
-==================================================
-basketball-bund.net bietet für jede Mannschaft einen iCal-Download.
-Das ist die robusteste Methode: strukturierte Daten, kein JS nötig,
-kein Scraping von HTML.
-
-iCal-URL Schema:
-  https://www.basketball-bund.net/mannschaft/{id}/ical
+BSG Usinger Land — DBB Spielplan Scraper (Playwright + iCal-Button)
+====================================================================
+basketball-bund.net rendert per JavaScript. Der iCal-Link wird erst
+nach Laden der Seite sichtbar. Dieses Script:
+  1. Öffnet jede Mannschaftsseite mit Playwright (headless Chromium)
+  2. Wartet bis der Spielplan geladen ist
+  3. Liest die Spielplandaten direkt aus der gerenderten Tabelle
+  4. Speichert alles als spiele.json
 
 Installation:
-  pip install requests icalendar
+  pip install playwright icalendar
+  playwright install chromium --with-deps
 
 Lokal testen:
   python scrape_dbb.py
 """
 
+import asyncio
 import json
 import re
-import requests
-from datetime import datetime, timezone, date
-from icalendar import Calendar
+from datetime import datetime, timezone
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-# ── Konfiguration ────────────────────────────────────────────
+# ── Konfiguration ─────────────────────────────────────────────────────
 TEAMS = {
-    "Herren":      "314544",
-    "Damen":       "314543",
-    "MU18":        "314547",
-    "WU18":        "316203",
-    "MU16":        "314548",
-    "MU14 Bezirk": "314549",
-    "WU14 Bezirk": "316717",
-    "MU14 Kreis":  "314550",
-    "WU14 Kreis":  "316717",
-    "Mix U12":     "314551",
-    "WU12":        "316675",
-    "WU10":        "322003",
-    "Kreis A X10": "314552",
+    "Herren":       "314544",
+    "Damen":        "314543",
+    "MU18":         "314547",
+    "WU18":         "316203",
+    "MU16":         "314548",
+    "MU14 Bezirk":  "314549",
+    "WU14 Bezirk":  "316717",
+    "MU14 Kreis":   "314550",
+    "WU14 Kreis":   "316717",
+    "Mix U12":      "314551",
+    "WU12":         "316675",
+    "WU10":         "322003",
+    "Kreis A X10":  "314552",
 }
 
-# Mögliche iCal-URL-Varianten von basketball-bund.net
-ICAL_URLS = [
-    "https://www.basketball-bund.net/mannschaft/{id}/ical",
-    "https://www.basketball-bund.net/rest/mannschaft/{id}/ical",
-    "https://www.basketball-bund.net/mannschaft/{id}/spielplan/ical",
-]
-
-BSG_NAMEN = ["bsg usinger", "usinger land"]
-HEADERS   = {
-    "User-Agent": "Mozilla/5.0 (compatible; BSG-Kalender/1.0)",
-    "Accept": "text/calendar, */*"
-}
+BSG_NAMEN = ["bsg usinger", "usinger land", "bsg u."]
 
 
 def ist_bsg(name: str) -> bool:
-    if not name:
-        return False
-    n = name.lower().strip()
+    n = (name or "").lower().strip()
     return any(s in n for s in BSG_NAMEN)
 
 
-def ergebnis_und_sieg(summary: str) -> tuple[str | None, bool | None]:
-    """Ergebnis aus SUMMARY/DESCRIPTION extrahieren: '74:61' → ('74:61', True)"""
-    m = re.search(r"(\d+)\s*:\s*(\d+)", summary or "")
+def parse_datum(text: str) -> str | None:
+    m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})", text or "")
+    if not m:
+        return None
+    tag, monat, jahr = int(m.group(1)), int(m.group(2)), m.group(3)
+    if len(jahr) == 2:
+        jahr = "20" + jahr
+    return f"{int(jahr):04d}-{monat:02d}-{tag:02d}"
+
+
+def parse_zeit(text: str) -> str:
+    m = re.search(r"(\d{1,2}):(\d{2})\s*(?:Uhr)?", text or "")
+    return f"{int(m.group(1)):02d}:{m.group(2)}" if m else ""
+
+
+def ergebnis_sieg(text: str):
+    m = re.search(r"(\d+)\s*:\s*(\d+)", text or "")
     if not m:
         return None, None
     h, g = int(m.group(1)), int(m.group(2))
     return f"{h}:{g}", h > g
 
 
-def hol_ical(mannschafts_id: str) -> bytes | None:
-    """Versucht verschiedene iCal-URL-Varianten"""
-    for url_tmpl in ICAL_URLS:
-        url = url_tmpl.format(id=mannschafts_id)
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=15)
-            if r.status_code == 200 and b"BEGIN:VCALENDAR" in r.content:
-                return r.content
-        except requests.RequestException:
-            continue
-    return None
+# ── Spielplan einer Mannschaft scrapen ───────────────────────────────
 
-
-def parse_ical(team_name: str, inhalt: bytes) -> list[dict]:
+async def scrape_mannschaft(page, team_name: str, mid: str) -> list[dict]:
+    url = f"https://www.basketball-bund.net/mannschaft/{mid}/spielplan"
     spiele = []
+
     try:
-        cal = Calendar.from_ical(inhalt)
-    except Exception as e:
-        print(f"  ⚠ iCal-Parse-Fehler: {e}")
-        return spiele
+        await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
 
-    for component in cal.walk():
-        if component.name != "VEVENT":
-            continue
+        # Warten bis entweder eine Tabelle oder der Text "keine Spiele" erscheint
+        try:
+            await page.wait_for_selector("table tr, .no-games, [class*='spielplan']", timeout=20_000)
+        except PWTimeout:
+            print(f"  ⚠  {team_name}: Timeout beim Laden")
+            return spiele
 
-        summary = str(component.get("SUMMARY", ""))
-        description = str(component.get("DESCRIPTION", ""))
-        dtstart = component.get("DTSTART")
+        # Alle Tabellenzeilen sammeln
+        rows = await page.query_selector_all("table tr")
 
-        if not dtstart:
-            continue
-
-        # Datum und Zeit extrahieren
-        dt = dtstart.dt
-        if isinstance(dt, datetime):
-            datum = dt.strftime("%Y-%m-%d")
-            zeit  = dt.strftime("%H:%M")
-        elif isinstance(dt, date):
-            datum = dt.strftime("%Y-%m-%d")
-            zeit  = ""
-        else:
-            continue
-
-        # Heim und Gast aus SUMMARY parsen
-        # Typisches Format: "BSG Usinger Land vs. TSV Bad Homburg"
-        # oder "Heim - Gast" oder "Heim : Gast"
-        heim = gast = ""
-        for sep in [" vs. ", " vs ", " - ", " : ", " – "]:
-            if sep in summary:
-                teile = summary.split(sep, 1)
-                heim  = teile[0].strip()
-                # Ergebnis aus dem Gast-Teil herausschneiden
-                gast_roh = teile[1].strip()
-                gast = re.sub(r"\d+\s*:\s*\d+", "", gast_roh).strip(" ()-")
-                break
-
-        if not heim:
-            # Fallback: beide Teams aus Description
-            m = re.search(r"Heim[:\s]+(.+?)\n.*Gast[:\s]+(.+)", description, re.I)
-            if m:
-                heim = m.group(1).strip()
-                gast = m.group(2).strip()
-
-        # BSG muss beteiligt sein
-        if not (ist_bsg(heim) or ist_bsg(gast) or ist_bsg(summary)):
-            # Viele iCal-Events sind Liga-weit — nur BSG-Spiele behalten
-            if "usinger" not in summary.lower() and "bsg" not in summary.lower():
+        for row in rows:
+            cells = await row.query_selector_all("td")
+            if len(cells) < 3:
                 continue
 
-        # Ergebnis suchen (in SUMMARY oder DESCRIPTION)
-        ergebnis_str, heim_sieg = ergebnis_und_sieg(summary)
-        if not ergebnis_str:
-            ergebnis_str, heim_sieg = ergebnis_und_sieg(description)
+            texte = []
+            for cell in cells:
+                texte.append(((await cell.inner_text()) or "").strip())
 
-        spiele.append({
-            "datum":    datum,
-            "zeit":     zeit,
-            "team":     team_name,
-            "heim":     heim or summary,
-            "gast":     gast,
-            "ergebnis": ergebnis_str,
-            "heimSieg": heim_sieg,
-        })
+            # Datum finden
+            datum = zeit = None
+            for t in texte:
+                d = parse_datum(t)
+                if d:
+                    datum = d
+                    zeit  = parse_zeit(t)
+                    break
+            if not datum:
+                continue
 
-    return spiele
+            # Teamnamen aus Links (zuverlässiger als Text-Parsing)
+            links = await row.query_selector_all("a")
+            namen = []
+            for lnk in links:
+                n = ((await lnk.inner_text()) or "").strip()
+                if n and len(n) > 2 and not re.match(r"^\d", n):
+                    namen.append(n)
+
+            heim = namen[0] if len(namen) > 0 else ""
+            gast = namen[1] if len(namen) > 1 else ""
+
+            # Fallback: Zellen direkt lesen
+            if not heim:
+                for i, t in enumerate(texte):
+                    if parse_datum(t) and i + 2 < len(texte):
+                        heim = texte[i + 1]
+                        gast = texte[i + 2]
+                        break
+
+            # Spiel muss BSG betreffen
+            if not (ist_bsg(heim) or ist_bsg(gast)):
+                # Nochmal im Rohtext der Zeile prüfen
+                zeile_text = (await row.inner_text() or "").lower()
+                if not any(s in zeile_text for s in BSG_NAMEN):
+                    continue
+
+            # Ergebnis: in letzter Zelle oder vorletzter
+            ergebnis, heim_sieg = None, None
+            for t in reversed(texte):
+                e, s = ergebnis_sieg(t)
+                if e:
+                    ergebnis  = e
+                    heim_sieg = s
+                    break
+
+            spiele.append({
+                "datum":    datum,
+                "zeit":     zeit or "",
+                "team":     team_name,
+                "heim":     heim or "BSG Usinger Land",
+                "gast":     gast or "",
+                "ergebnis": ergebnis,
+                "heimSieg": heim_sieg,
+            })
+
+    except Exception as e:
+        print(f"  ✗  {team_name}: {e}")
+
+    # Duplikate weg
+    seen, result = set(), []
+    for s in spiele:
+        key = (s["datum"], s["heim"], s["gast"])
+        if key not in seen:
+            seen.add(key)
+            result.append(s)
+
+    print(f"  ✓  {team_name}: {len(result)} Spiele")
+    return result
 
 
-def main():
-    print("BSG Usinger Land — iCal Spielplan Scraper")
+# ── Cookie-Banner wegklicken ─────────────────────────────────────────
+
+async def cookie_banner_schliessen(page):
+    try:
+        await page.goto("https://www.basketball-bund.net", wait_until="domcontentloaded", timeout=20_000)
+        await page.wait_for_timeout(2_000)
+        for btn in await page.query_selector_all("button"):
+            txt = ((await btn.inner_text()) or "").lower()
+            if any(w in txt for w in ["akzeptiere", "zustimmen", "ich akzeptiere", "alle akzeptieren"]):
+                await btn.click()
+                await page.wait_for_timeout(500)
+                print("  ✓  Cookie-Banner geschlossen")
+                return
+    except Exception:
+        pass
+
+
+# ── Hauptprogramm ────────────────────────────────────────────────────
+
+async def main():
+    print("BSG Usinger Land — Spielplan Scraper")
     print("=" * 44)
 
     alle_spiele      = []
     bereits_gescrapt = set()
 
-    for team_name, mid in TEAMS.items():
-        if mid in bereits_gescrapt:
-            print(f"  ↩ {team_name}: ID {mid} bereits abgerufen")
-            continue
-        bereits_gescrapt.add(mid)
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            locale="de-DE",
+        )
+        page = await context.new_page()
 
-        print(f"  → {team_name} (ID: {mid})")
-        inhalt = hol_ical(mid)
+        await cookie_banner_schliessen(page)
 
-        if not inhalt:
-            print(f"  ⚠ Kein iCal für {team_name} — versuche HTML-Fallback")
-            # HTML-Fallback: einfacher requests-Abruf der Spielplan-Seite
-            try:
-                url = f"https://www.basketball-bund.net/mannschaft/{mid}/spielplan"
-                r = requests.get(url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=15)
-                if r.status_code == 200:
-                    # Ergebnisse per Regex direkt aus HTML fischen
-                    matches = re.findall(
-                        r'(\d{2}\.\d{2}\.\d{4})[^<]*?(\d{1,2}:\d{2})[^<]*?'
-                        r'([A-Za-zÄÖÜäöüß\s\.\-]+?)\s*(?:vs\.?|-|:)\s*'
-                        r'([A-Za-zÄÖÜäöüß\s\.\-]+?)(?:\s+(\d+:\d+))?',
-                        r.text
-                    )
-                    for m in matches:
-                        datum_raw, zeit_raw, heim_raw, gast_raw, erg_raw = m
-                        if not (ist_bsg(heim_raw) or ist_bsg(gast_raw)):
-                            continue
-                        d = datetime.strptime(datum_raw, "%d.%m.%Y")
-                        ergebnis_str, heim_sieg = ergebnis_und_sieg(erg_raw) if erg_raw else (None, None)
-                        alle_spiele.append({
-                            "datum":    d.strftime("%Y-%m-%d"),
-                            "zeit":     zeit_raw,
-                            "team":     team_name,
-                            "heim":     heim_raw.strip(),
-                            "gast":     gast_raw.strip(),
-                            "ergebnis": ergebnis_str,
-                            "heimSieg": heim_sieg,
-                        })
-                    print(f"     HTML-Fallback: gefunden")
-            except Exception as e:
-                print(f"  ✗ Auch HTML-Fallback fehlgeschlagen: {e}")
-            continue
+        for team_name, mid in TEAMS.items():
+            if mid in bereits_gescrapt:
+                print(f"  ↩  {team_name}: ID {mid} übersprungen")
+                continue
+            bereits_gescrapt.add(mid)
+            spiele = await scrape_mannschaft(page, team_name, mid)
+            alle_spiele.extend(spiele)
 
-        spiele = parse_ical(team_name, inhalt)
-        alle_spiele.extend(spiele)
-        print(f"     {len(spiele)} Spiele aus iCal")
+        await browser.close()
 
-    # Duplikate entfernen und sortieren
-    gesehen, eindeutig = set(), []
+    # Global deduplizieren und sortieren
+    seen, eindeutig = set(), []
     for s in alle_spiele:
-        key = (s["datum"], s.get("heim", ""), s.get("gast", ""))
-        if key not in gesehen:
-            gesehen.add(key)
+        key = (s["datum"], s["heim"], s["gast"])
+        if key not in seen:
+            seen.add(key)
             eindeutig.append(s)
-
     eindeutig.sort(key=lambda s: (s["datum"], s.get("zeit", "")))
 
     ausgabe = {
@@ -229,8 +238,13 @@ def main():
         json.dump(ausgabe, f, ensure_ascii=False, indent=2)
 
     print("=" * 44)
-    print(f"✓ {len(eindeutig)} Spiele → spiele.json")
+    print(f"✓  {len(eindeutig)} Spiele → spiele.json")
+    if len(eindeutig) == 0:
+        print("\n  Mögliche Ursachen für 0 Spiele:")
+        print("  • Saison noch nicht gestartet / keine Spiele eingetragen")
+        print("  • basketball-bund.net hat die Seitenstruktur geändert")
+        print("  • Cookie-Banner hat Tabelle blockiert")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
