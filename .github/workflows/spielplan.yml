@@ -1,0 +1,48 @@
+# .github/workflows/spielplan.yml
+#
+# Läuft automatisch stündlich + bei jedem Push
+# Scrapt basketball-bund.net und committet spiele.json ins Repo
+# Die Website liest spiele.json dann direkt von GitHub aus
+
+name: Spielplan aktualisieren
+
+on:
+  schedule:
+    # Jede Stunde (UTC) — in Deutschland also jede Stunde
+    - cron: '0 * * * *'
+  # Auch manuell auslösbar über GitHub UI
+  workflow_dispatch:
+  # Und bei jedem Push (zum Testen)
+  push:
+    paths:
+      - 'scrape_dbb.py'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # darf ins Repo committen
+
+    steps:
+      - name: Repo auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Abhängigkeiten installieren
+        run: pip install requests beautifulsoup4
+
+      - name: Spielplan scrapen
+        run: python scrape_dbb.py
+
+      - name: spiele.json committen (nur wenn geändert)
+        run: |
+          git config user.name  "BSG Spielplan Bot"
+          git config user.email "bot@bsg-usingerland.de"
+          git add spiele.json
+          # Nur committen wenn sich etwas geändert hat
+          git diff --staged --quiet || git commit -m "Spielplan aktualisiert $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push
