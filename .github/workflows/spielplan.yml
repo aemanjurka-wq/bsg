@@ -2,8 +2,8 @@ name: Spielplan aktualisieren
 
 on:
   schedule:
-    - cron: '0 * * * *'   # jede Stunde
-  workflow_dispatch:        # manuell auslösbar
+    - cron: "0 * * * *"
+  workflow_dispatch:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -19,7 +19,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
       - name: Playwright + Chromium installieren
         run: |
@@ -30,14 +30,20 @@ jobs:
         run: python scrape_dbb.py
 
       - name: Ergebnis anzeigen
-        run: python3 -c 'import json; d=json.load(open("spiele.json")); print("Gefunden:", d["anzahl"], "Spiele, Stand:", d["aktualisiert"])'
-
-      - name: spiele.json committen (nur wenn geändert)
         run: |
-          ANZAHL=$(python3 -c 'import json; print(json.load(open("spiele.json"))["anzahl"])')
-          DATUM=$(date -u '+%Y-%m-%d %H:%M UTC')
-          git config user.name  "BSG Spielplan Bot"
+          python3 -c "
+          import json
+          d = json.load(open('spiele.json'))
+          print('Gefunden:', d['anzahl'], 'Spiele')
+          print('Stand:', d['aktualisiert'])
+          "
+
+      - name: spiele.json committen
+        run: |
+          ANZAHL=$(python3 -c "import json; print(json.load(open('spiele.json'))['anzahl'])")
+          DATUM=$(date -u "+%Y-%m-%d %H:%M UTC")
+          git config user.name "BSG Spielplan Bot"
           git config user.email "bot@bsg-usingerland.de"
           git add spiele.json
-          git diff --staged --quiet || git commit -m "Spielplan $DATUM - $ANZAHL Spiele"
+          git diff --staged --quiet || git commit -m "Spielplan ${DATUM} - ${ANZAHL} Spiele"
           git push
