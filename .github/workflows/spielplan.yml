@@ -30,12 +30,14 @@ jobs:
         run: python scrape_dbb.py
 
       - name: Ergebnis anzeigen
-        run: cat spiele.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'Gefunden: {d[\"anzahl\"]} Spiele, Stand: {d[\"aktualisiert\"]}')"
+        run: python3 -c 'import json; d=json.load(open("spiele.json")); print("Gefunden:", d["anzahl"], "Spiele, Stand:", d["aktualisiert"])'
 
       - name: spiele.json committen (nur wenn geändert)
         run: |
+          ANZAHL=$(python3 -c 'import json; print(json.load(open("spiele.json"))["anzahl"])')
+          DATUM=$(date -u '+%Y-%m-%d %H:%M UTC')
           git config user.name  "BSG Spielplan Bot"
           git config user.email "bot@bsg-usingerland.de"
           git add spiele.json
-          git diff --staged --quiet || git commit -m "Spielplan $(date -u '+%Y-%m-%d %H:%M UTC') — $(cat spiele.json | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"anzahl\"])') Spiele"
+          git diff --staged --quiet || git commit -m "Spielplan $DATUM - $ANZAHL Spiele"
           git push
