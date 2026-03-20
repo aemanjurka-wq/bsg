@@ -2,8 +2,11 @@ name: Spielplan aktualisieren
 
 on:
   schedule:
-    - cron: '0 * * * *'   # jede Stunde
-  workflow_dispatch:        # manuell auslösbar
+    - cron: '0 * * * *'   # jede Stunde automatisch
+  workflow_dispatch:        # manuell auslösbar über GitHub UI
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # Node 24, keine Deprecation-Warnung
 
 jobs:
   scrape:
@@ -12,21 +15,21 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Repo auschecken
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Python 3.12 einrichten
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Playwright installieren
-        run: |
-          pip install playwright
-          playwright install chromium --with-deps
+      - name: Abhängigkeiten installieren
+        run: pip install requests icalendar
 
       - name: Spielplan scrapen
         run: python scrape_dbb.py
 
-      - name: spiele.json committen
+      - name: spiele.json committen (nur wenn geändert)
         run: |
           git config user.name  "BSG Spielplan Bot"
           git config user.email "bot@bsg-usingerland.de"
