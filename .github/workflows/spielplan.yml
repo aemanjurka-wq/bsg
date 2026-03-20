@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Playwright + Chromium installieren
+      - name: Playwright installieren
         run: |
           pip install playwright
           playwright install chromium --with-deps
@@ -29,21 +29,12 @@ jobs:
       - name: Spielplan scrapen
         run: python scrape_dbb.py
 
-      - name: Ergebnis anzeigen
-        run: |
-          python3 -c "
-          import json
-          d = json.load(open('spiele.json'))
-          print('Gefunden:', d['anzahl'], 'Spiele')
-          print('Stand:', d['aktualisiert'])
-          "
-
-      - name: spiele.json committen
+      - name: Debug-Dateien + spiele.json committen
         run: |
           ANZAHL=$(python3 -c "import json; print(json.load(open('spiele.json'))['anzahl'])")
           DATUM=$(date -u "+%Y-%m-%d %H:%M UTC")
           git config user.name "BSG Spielplan Bot"
           git config user.email "bot@bsg-usingerland.de"
-          git add spiele.json
+          git add spiele.json debug_*.html debug_*.png
           git diff --staged --quiet || git commit -m "Spielplan ${DATUM} - ${ANZAHL} Spiele"
           git push
