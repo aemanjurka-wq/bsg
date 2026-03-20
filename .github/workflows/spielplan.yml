@@ -2,11 +2,11 @@ name: Spielplan aktualisieren
 
 on:
   schedule:
-    - cron: '0 * * * *'   # jede Stunde automatisch
-  workflow_dispatch:        # manuell auslösbar über GitHub UI
+    - cron: '0 * * * *'   # jede Stunde
+  workflow_dispatch:        # manuell auslösbar
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # Node 24, keine Deprecation-Warnung
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   scrape:
@@ -15,24 +15,27 @@ jobs:
       contents: write
 
     steps:
-      - name: Repo auschecken
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Python 3.12 einrichten
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Abhängigkeiten installieren
-        run: pip install requests icalendar
+      - name: Playwright + Chromium installieren
+        run: |
+          pip install playwright
+          playwright install chromium --with-deps
 
       - name: Spielplan scrapen
         run: python scrape_dbb.py
+
+      - name: Ergebnis anzeigen
+        run: cat spiele.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'Gefunden: {d[\"anzahl\"]} Spiele, Stand: {d[\"aktualisiert\"]}')"
 
       - name: spiele.json committen (nur wenn geändert)
         run: |
           git config user.name  "BSG Spielplan Bot"
           git config user.email "bot@bsg-usingerland.de"
           git add spiele.json
-          git diff --staged --quiet || git commit -m "Spielplan $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git diff --staged --quiet || git commit -m "Spielplan $(date -u '+%Y-%m-%d %H:%M UTC') — $(cat spiele.json | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"anzahl\"])') Spiele"
           git push
